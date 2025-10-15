@@ -1,0 +1,7 @@
+{
+  "board": "NUCLEO-F767ZI",
+  "device": "STM32F767ZIT6",
+  "core": "Cortex-M7",
+  "order": 0,
+  "toolchain": "CLANG"
+}
