@@ -33,6 +33,8 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+// Set to 1 to enable periodic debug prints on USART3 while streaming
+#define ENABLE_UART3_DEBUG 0
 
 /* USER CODE END PD */
 
@@ -74,8 +76,6 @@ UART_HandleTypeDef huart2;
 UART_HandleTypeDef huart3;
 UART_HandleTypeDef huart6;
 
-PCD_HandleTypeDef hpcd_USB_OTG_FS;
-
 /* USER CODE BEGIN PV */
 // OEM719 GNSS receiver buffers and state
 #define OEM_RX_BUF_SIZE 512
@@ -94,7 +94,6 @@ static void MX_SPI1_Init(void);
 static void MX_SPI2_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_USART3_UART_Init(void);
-static void MX_USB_OTG_FS_PCD_Init(void);
 static void MX_DAC_Init(void);
 static void MX_SPI4_Init(void);
 static void MX_SPI5_Init(void);
@@ -105,6 +104,22 @@ static void MX_USART6_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+static void UART6_ClearErrorsAndFlush(void)
+{
+  __HAL_UART_CLEAR_PEFLAG(&huart6);
+  __HAL_UART_CLEAR_FEFLAG(&huart6);
+  __HAL_UART_CLEAR_NEFLAG(&huart6);
+  __HAL_UART_CLEAR_OREFLAG(&huart6);
+  __HAL_UART_CLEAR_IDLEFLAG(&huart6);
+
+  while (__HAL_UART_GET_FLAG(&huart6, UART_FLAG_RXNE)) {
+    volatile uint8_t discard = (uint8_t)(huart6.Instance->RDR & 0xFF);
+    (void)discard;
+  }
+}
+
+volatile uint32_t oem_uart_error_count = 0;
 
 volatile bool slave_rx_done         = false;
 volatile bool master_tx_done        = false;
@@ -151,6 +166,15 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
         oem_rx_byte_ready = true;
         
         // Restart reception for next byte
+        HAL_UART_Receive_IT(&huart6, &oem_rx_single, 1);
+    }
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    if (huart == &huart6) {
+        oem_uart_error_count++;
+        UART6_ClearErrorsAndFlush();
         HAL_UART_Receive_IT(&huart6, &oem_rx_single, 1);
     }
 }
@@ -240,7 +264,6 @@ int main(void)
   MX_SPI2_Init();
   MX_USART2_UART_Init();
   MX_USART3_UART_Init();
-  MX_USB_OTG_FS_PCD_Init();
   MX_DAC_Init();
   MX_SPI4_Init();
   MX_SPI5_Init();
@@ -250,8 +273,98 @@ int main(void)
   const char hello[] = "\r\n=== OEM719 GNSS Baudrate Scanner ===\r\n";
   HAL_UART_Transmit(&huart3, (uint8_t*)hello, strlen(hello), HAL_MAX_DELAY);
   
-  // Common OEM719 baudrates to test
-  uint32_t baudrates[] = {115200, 230400, 460800, 57600, 38400, 19200, 9600};
+  // ============================================================
+  // HARDWARE TEST: USART6 Loopback (connect TX to RX)
+  // ============================================================
+  const char test_msg[] = "\r\n[HW TEST] Testing USART6 loopback...\r\n";
+  HAL_UART_Transmit(&huart3, (uint8_t*)test_msg, strlen(test_msg), HAL_MAX_DELAY);
+  const char test2[] = "[HW TEST] If you see garbage below, it's a hardware/EMI issue!\r\n";
+  HAL_UART_Transmit(&huart3, (uint8_t*)test2, strlen(test2), HAL_MAX_DELAY);
+  
+  // Send test pattern on USART6 TX and receive it back
+  const char loopback_pattern[] = "LOOPBACK_TEST_12345_ABCDE\r\n";
+  oem_rx_head = 0;
+  HAL_UART_Receive_IT(&huart6, &oem_rx_single, 1);
+  
+  // Short TX to RX externally or check with scope
+  HAL_UART_Transmit(&huart6, (uint8_t*)loopback_pattern, strlen(loopback_pattern), HAL_MAX_DELAY);
+  HAL_Delay(200);
+  
+  const char lb_result[] = "[HW TEST] USART6 loopback result:\r\n";
+  HAL_UART_Transmit(&huart3, (uint8_t*)lb_result, strlen(lb_result), HAL_MAX_DELAY);
+  if (oem_rx_head > 0) {
+      const char lb_hex[] = "  Received (HEX): ";
+      HAL_UART_Transmit(&huart3, (uint8_t*)lb_hex, strlen(lb_hex), HAL_MAX_DELAY);
+      for (int i = 0; i < oem_rx_head && i < 50; i++) {
+          char hex[4];
+          snprintf(hex, sizeof(hex), "%02X ", oem_rx_buffer[i]);
+          HAL_UART_Transmit(&huart3, (uint8_t*)hex, strlen(hex), HAL_MAX_DELAY);
+      }
+      HAL_UART_Transmit(&huart3, (uint8_t*)"\r\n", 2, HAL_MAX_DELAY);
+      const char lb_ascii[] = "  Received (ASCII): ";
+      HAL_UART_Transmit(&huart3, (uint8_t*)lb_ascii, strlen(lb_ascii), HAL_MAX_DELAY);
+      HAL_UART_Transmit(&huart3, oem_rx_buffer, oem_rx_head, HAL_MAX_DELAY);
+      HAL_UART_Transmit(&huart3, (uint8_t*)"\r\n", 2, HAL_MAX_DELAY);
+  } else {
+      const char no_loop[] = "  [No loopback data - TX/RX not connected]\r\n";
+      HAL_UART_Transmit(&huart3, (uint8_t*)no_loop, strlen(no_loop), HAL_MAX_DELAY);
+  }
+  const char test_done[] = "[HW TEST] If loopback is clean but OEM719 is garbled, check:\r\n";
+  HAL_UART_Transmit(&huart3, (uint8_t*)test_done, strlen(test_done), HAL_MAX_DELAY);
+  const char test_check1[] = "  1. *** CRITICAL: COMMON GROUND REQUIRED! ***\r\n";
+  HAL_UART_Transmit(&huart3, (uint8_t*)test_check1, strlen(test_check1), HAL_MAX_DELAY);
+  const char test_check2[] = "     Connect OEM719 GND to STM32 GND!\r\n";
+  HAL_UART_Transmit(&huart3, (uint8_t*)test_check2, strlen(test_check2), HAL_MAX_DELAY);
+  const char test_check3[] = "     Without common ground, voltage levels are undefined!\r\n";
+  HAL_UART_Transmit(&huart3, (uint8_t*)test_check3, strlen(test_check3), HAL_MAX_DELAY);
+  const char test_check4[] = "  2. OEM719 TX voltage (should be 3.3V, not 5V!)\r\n";
+  HAL_UART_Transmit(&huart3, (uint8_t*)test_check4, strlen(test_check4), HAL_MAX_DELAY);
+  const char test_check5[] = "  3. Wire length (keep under 30cm for high baud)\r\n\r\n";
+  HAL_UART_Transmit(&huart3, (uint8_t*)test_check5, strlen(test_check5), HAL_MAX_DELAY);
+  
+  oem_rx_head = 0;
+  HAL_UART_Abort(&huart6);
+  
+  // ============================================================
+  // CRITICAL FIX: Send blind reset commands at multiple baud rates
+  // to recover from previous configuration changes
+  // ============================================================
+  const char msg_reset[] = "[RECOVERY] Sending UNLOG at common baud rates to clear OEM719 state...\r\n";
+  HAL_UART_Transmit(&huart3, (uint8_t*)msg_reset, strlen(msg_reset), HAL_MAX_DELAY);
+  
+  uint32_t recovery_bauds[] = {9600, 115200, 230400, 460800, 19200};
+  for (int r = 0; r < 5; r++) {
+      HAL_UART_Abort(&huart6);
+      huart6.Init.BaudRate = recovery_bauds[r];
+      HAL_UART_Init(&huart6);
+      
+      UART6_ClearErrorsAndFlush();
+      __HAL_UART_ENABLE_IT(&huart6, UART_IT_ERR);
+      __HAL_UART_ENABLE_IT(&huart6, UART_IT_PE);
+      
+      // CRITICAL: Start RX interrupt BEFORE sending command!
+      HAL_UART_Receive_IT(&huart6, &oem_rx_single, 1);
+      HAL_Delay(50);
+      
+      // FORCE responses back ON (in case previous run disabled them)
+      const char force_on[] = "INTERFACEMODE COM1 NONE NONE ON\r\n";
+      HAL_UART_Transmit(&huart6, (uint8_t*)force_on, strlen(force_on), 100);
+      HAL_Delay(50);
+      
+      // Send UNLOG blind (will work if OEM719 is at this baud rate)
+      const char unlog_blind[] = "UNLOG\r\n";
+      HAL_UART_Transmit(&huart6, (uint8_t*)unlog_blind, strlen(unlog_blind), 100);
+      HAL_Delay(100);  // Give time for response
+  }
+  
+  const char msg_reset_done[] = "[RECOVERY] Recovery commands sent\r\n";
+  HAL_UART_Transmit(&huart3, (uint8_t*)msg_reset_done, strlen(msg_reset_done), HAL_MAX_DELAY);
+  
+  HAL_UART_Abort(&huart6);
+  oem_rx_head = 0;  // NOW clear buffer after recovery
+  
+  // Common OEM719 baudrates to test (starting with most reliable)
+  uint32_t baudrates[] = {9600, 19200, 38400, 57600, 115200, 230400, 460800};
   int num_baudrates = 7;
   bool found = false;
   uint32_t working_baudrate = 0;
@@ -269,31 +382,48 @@ int main(void)
           Error_Handler();
       }
       
+      // Clear residual flags/data and enable error interrupts before RX
+      UART6_ClearErrorsAndFlush();
+      __HAL_UART_ENABLE_IT(&huart6, UART_IT_ERR);
+      __HAL_UART_ENABLE_IT(&huart6, UART_IT_PE);
+      
       // Start interrupt-driven reception
-      oem_rx_head = 0;  // Clear buffer
       HAL_UART_Receive_IT(&huart6, &oem_rx_single, 1);
       
-      HAL_Delay(100);
+      HAL_Delay(100);  // Brief stabilization
       
-      // Send UNLOG command (abbreviated)
-      const char unlog[] = "UNLOG\r\n";
-      HAL_UART_Transmit(&huart6, (uint8_t*)unlog, strlen(unlog), HAL_MAX_DELAY);
+      // Clear buffer BEFORE sending command
+      oem_rx_head = 0;
       
-      HAL_Delay(500);  // Wait for response
+      // Send VERSION command (lighter than UNLOG, always responds)
+      const char ver[] = "VERSION\r\n";
+      HAL_UART_Transmit(&huart6, (uint8_t*)ver, strlen(ver), HAL_MAX_DELAY);
       
-      // Check if we got a response
-      if (oem_rx_head > 5) {  // Should get at least "<OK" response
+      HAL_Delay(1500);  // Wait for response (OEM719 might be processing)
+      
+      // Check if we got a response (looking for any data, even just \r\n)
+      if (oem_rx_head > 2) {  // At least got \r\n or some response
           char success[100];
           snprintf(success, sizeof(success), 
                    "*** SUCCESS! OEM719 responded at %lu baud! ***\r\n", 
                    (unsigned long)baudrates[i]);
           HAL_UART_Transmit(&huart3, (uint8_t*)success, strlen(success), HAL_MAX_DELAY);
           
-          // Show what we received
-          const char resp[] = "Response: ";
+          // Show what we received (ASCII)
+          const char resp[] = "Response (ASCII): ";
           HAL_UART_Transmit(&huart3, (uint8_t*)resp, strlen(resp), HAL_MAX_DELAY);
           HAL_UART_Transmit(&huart3, oem_rx_buffer, 
-                           (oem_rx_head < 60) ? oem_rx_head : 60, HAL_MAX_DELAY);
+                           (oem_rx_head < 40) ? oem_rx_head : 40, HAL_MAX_DELAY);
+          HAL_UART_Transmit(&huart3, (uint8_t*)"\r\n", 2, HAL_MAX_DELAY);
+          
+          // Show hex dump to diagnose binary vs ASCII
+          const char hex_label[] = "Response (HEX): ";
+          HAL_UART_Transmit(&huart3, (uint8_t*)hex_label, strlen(hex_label), HAL_MAX_DELAY);
+          for (int j = 0; j < oem_rx_head && j < 40; j++) {
+              char hex[4];
+              snprintf(hex, sizeof(hex), "%02X ", oem_rx_buffer[j]);
+              HAL_UART_Transmit(&huart3, (uint8_t*)hex, strlen(hex), HAL_MAX_DELAY);
+          }
           HAL_UART_Transmit(&huart3, (uint8_t*)"\r\n\r\n", 3, HAL_MAX_DELAY);
           
           found = true;
@@ -338,6 +468,11 @@ int main(void)
   if (HAL_UART_Init(&huart6) != HAL_OK) {
       Error_Handler();
   }
+  
+  // Clear residual flags/data and enable error interrupts before RX
+  UART6_ClearErrorsAndFlush();
+  __HAL_UART_ENABLE_IT(&huart6, UART_IT_ERR);
+  __HAL_UART_ENABLE_IT(&huart6, UART_IT_PE);
   HAL_UART_Receive_IT(&huart6, &oem_rx_single, 1);
   
   oem_rx_head = 0;  // Clear buffer
@@ -349,34 +484,25 @@ int main(void)
   oem_rx_head = 0;
   
   // ============================================================
-  // Step 3: Configure serial port at CURRENT baudrate
-  // Critical: Set break detection OFF (stays at working baudrate)
+  // Step 3: Lock baud rate at detected rate and disable auto-switching
+  // CRITICAL: Do NOT change baud rate - keep at working_baudrate!
   // ============================================================
+  const char msg_lock[] = "[STM32] Locking communication at detected baud rate\r\n";
+  HAL_UART_Transmit(&huart3, (uint8_t*)msg_lock, strlen(msg_lock), HAL_MAX_DELAY);
+  
+  // Just disable break detection, don't change the baud rate
   char serialcmd[80];
   snprintf(serialcmd, sizeof(serialcmd), "SERIALCONFIG COM1 %lu N 8 1 N OFF\r\n", 
            (unsigned long)working_baudrate);
+  
+  oem_rx_head = 0;  // Clear before sending
   HAL_UART_Transmit(&huart6, (uint8_t*)serialcmd, strlen(serialcmd), HAL_MAX_DELAY);
   
-  char msg_serial[100];
-  snprintf(msg_serial, sizeof(msg_serial), "[STM32] SERIALCONFIG %lu baud, break OFF\r\n", 
-           (unsigned long)working_baudrate);
-  HAL_UART_Transmit(&huart3, (uint8_t*)msg_serial, strlen(msg_serial), HAL_MAX_DELAY);
+  HAL_Delay(300);
   
-  HAL_Delay(500);
-  
-  // Check SERIALCONFIG response
+  // Check response briefly
   if (oem_rx_head > 0) {
-      char resp[80];
-      snprintf(resp, sizeof(resp), "[STM32] SERIALCONFIG response (%d bytes): ", oem_rx_head);
-      HAL_UART_Transmit(&huart3, (uint8_t*)resp, strlen(resp), HAL_MAX_DELAY);
-      
-      for (int i = 0; i < oem_rx_head && i < 30; i++) {
-          char hex[4];
-          snprintf(hex, sizeof(hex), "%02X ", oem_rx_buffer[i]);
-          HAL_UART_Transmit(&huart3, (uint8_t*)hex, strlen(hex), HAL_MAX_DELAY);
-      }
-      
-      // Check for <OK (3C 4F 4B)
+      // Check for <OK
       bool got_ok = false;
       for (int i = 0; i < oem_rx_head - 2; i++) {
           if (oem_rx_buffer[i] == 0x3C && oem_rx_buffer[i+1] == 0x4F && oem_rx_buffer[i+2] == 0x4B) {
@@ -386,16 +512,13 @@ int main(void)
       }
       
       if (got_ok) {
-          const char msg_ok[] = " [GOT <OK!]\r\n";
+          const char msg_ok[] = "[STM32] SERIALCONFIG confirmed\r\n";
           HAL_UART_Transmit(&huart3, (uint8_t*)msg_ok, strlen(msg_ok), HAL_MAX_DELAY);
-      } else {
-          const char msg_bad[] = " [NO <OK - GARBLED!]\r\n";
-          HAL_UART_Transmit(&huart3, (uint8_t*)msg_bad, strlen(msg_bad), HAL_MAX_DELAY);
       }
   }
   
   oem_rx_head = 0;
-  HAL_Delay(500);
+  HAL_Delay(200);
   
   const char msg_stay[] = "[STM32] Communication stable, ready for logging\r\n\r\n";
   HAL_UART_Transmit(&huart3, (uint8_t*)msg_stay, strlen(msg_stay), HAL_MAX_DELAY);
@@ -463,15 +586,25 @@ int main(void)
   oem_rx_head = 0;
   
   // ============================================================
-  // Step 6: FORCE ASCII mode explicitly
+  // Step 6: FORCE ASCII mode explicitly (RX and TX both ASCII)
   // ============================================================
   const char msg_force[] = "[STM32] Forcing INTERFACEMODE to ASCII...\r\n";
   HAL_UART_Transmit(&huart3, (uint8_t*)msg_force, strlen(msg_force), HAL_MAX_DELAY);
   
-  const char ifmode[] = "INTERFACEMODE COM1 NOVATEL NOVATEL ON\r\n";
-  HAL_UART_Transmit(&huart6, (uint8_t*)ifmode, strlen(ifmode), HAL_MAX_DELAY);
+  // OEM719 INTERFACEMODE: port rxtype txtype responses
+  // NONE = Auto-detect format (defaults to ASCII)
+  // ON = Enable responses (CRITICAL - without this OEM719 goes silent!)
+  oem_rx_head = 0;
   
-  HAL_Delay(500);
+  // Method 1: Set interface to auto-detect with responses ENABLED
+  const char ifmode1[] = "INTERFACEMODE COM1 NONE NONE ON\r\n";
+  HAL_UART_Transmit(&huart6, (uint8_t*)ifmode1, strlen(ifmode1), HAL_MAX_DELAY);
+  HAL_Delay(200);
+  
+  // Method 2: Explicitly request ASCII via UNLOGALL (clears binary logs too)
+  const char unlog2[] = "UNLOGALL TRUE\r\n";
+  HAL_UART_Transmit(&huart6, (uint8_t*)unlog2, strlen(unlog2), HAL_MAX_DELAY);
+  HAL_Delay(200);
   
   if (oem_rx_head > 0) {
       char resp[80];
@@ -505,83 +638,80 @@ int main(void)
   oem_rx_head = 0;
   
   // ============================================================
-  // Step 7: Request TIMEA (ASCII format explicitly)
+  // Step 7: Enable 1PPS (Pulse Per Second) output for timing
   // ============================================================
+  const char pps_cmd[] = "PPSCONTROL ENABLE POSITIVE 1.0 0\r\n";
+  HAL_UART_Transmit(&huart6, (uint8_t*)pps_cmd, strlen(pps_cmd), HAL_MAX_DELAY);
+  
+  const char msg_pps[] = "[STM32] Enabling 1PPS output (pulse-per-second timing)\r\n";
+  HAL_UART_Transmit(&huart3, (uint8_t*)msg_pps, strlen(msg_pps), HAL_MAX_DELAY);
+  HAL_Delay(200);
+  oem_rx_head = 0;
+  
+  // ============================================================
+  // Step 8: Request logs that will ALWAYS output (to verify TX works)
+  // ============================================================
+  
+  // VERSION log - outputs IMMEDIATELY, no GPS needed, repeats every 10 seconds
+  const char versioncmd[] = "LOG VERSIONA ONTIME 10\r\n";
+  HAL_UART_Transmit(&huart6, (uint8_t*)versioncmd, strlen(versioncmd), HAL_MAX_DELAY);
+  HAL_Delay(100);
+  
+  // RXSTATUS log - outputs receiver status every 5 seconds, no GPS needed
+  const char rxstatuscmd[] = "LOG RXSTATUSA ONTIME 5\r\n";
+  HAL_UART_Transmit(&huart6, (uint8_t*)rxstatuscmd, strlen(rxstatuscmd), HAL_MAX_DELAY);
+  HAL_Delay(100);
+  
+  // Position logs (only work with GPS lock)
+  const char bestposcmd[] = "LOG BESTPOSA ONTIME 1\r\n";
+  HAL_UART_Transmit(&huart6, (uint8_t*)bestposcmd, strlen(bestposcmd), HAL_MAX_DELAY);
+  HAL_Delay(100);
+  
   const char timecmd[] = "LOG TIMEA ONTIME 1\r\n";
   HAL_UART_Transmit(&huart6, (uint8_t*)timecmd, strlen(timecmd), HAL_MAX_DELAY);
+  HAL_Delay(100);
   
-  const char msg_time[] = "[STM32] LOG TIMEA ONTIME 1\r\n";
+  const char msg_logs[] = "[STM32] Enabled logs:\r\n";
+  HAL_UART_Transmit(&huart3, (uint8_t*)msg_logs, strlen(msg_logs), HAL_MAX_DELAY);
+  const char msg_ver[] = "  - VERSIONA (every 10s) - ALWAYS outputs\r\n";
+  HAL_UART_Transmit(&huart3, (uint8_t*)msg_ver, strlen(msg_ver), HAL_MAX_DELAY);
+  const char msg_rx[] = "  - RXSTATUSA (every 5s) - ALWAYS outputs\r\n";
+  HAL_UART_Transmit(&huart3, (uint8_t*)msg_rx, strlen(msg_rx), HAL_MAX_DELAY);
+  const char msg_pos[] = "  - BESTPOSA (1Hz) - needs GPS lock\r\n";
+  HAL_UART_Transmit(&huart3, (uint8_t*)msg_pos, strlen(msg_pos), HAL_MAX_DELAY);
+  const char msg_time[] = "  - TIMEA (1Hz) - needs GPS lock\r\n";
   HAL_UART_Transmit(&huart3, (uint8_t*)msg_time, strlen(msg_time), HAL_MAX_DELAY);
-  
-  HAL_Delay(500);
-  
-  if (oem_rx_head > 0) {
-      char resp[60];
-      snprintf(resp, sizeof(resp), "[STM32] LOG response (%d bytes): ", oem_rx_head);
-      HAL_UART_Transmit(&huart3, (uint8_t*)resp, strlen(resp), HAL_MAX_DELAY);
-      
-      for (int i = 0; i < oem_rx_head && i < 30; i++) {
-          char hex[4];
-          snprintf(hex, sizeof(hex), "%02X ", oem_rx_buffer[i]);
-          HAL_UART_Transmit(&huart3, (uint8_t*)hex, strlen(hex), HAL_MAX_DELAY);
-      }
-      
-      // Check for ASCII <OK (3C 4F 4B)
-      bool got_ok = false;
-      for (int i = 0; i < oem_rx_head - 2; i++) {
-          if (oem_rx_buffer[i] == 0x3C && oem_rx_buffer[i+1] == 0x4F && oem_rx_buffer[i+2] == 0x4B) {
-              got_ok = true;
-              break;
-          }
-      }
-      
-      if (got_ok) {
-          const char msg_ok[] = " [ASCII <OK!]\r\n";
-          HAL_UART_Transmit(&huart3, (uint8_t*)msg_ok, strlen(msg_ok), HAL_MAX_DELAY);
-      } else {
-          const char msg_nok[] = "\r\n[STM32] WARNING: Response not clean ASCII!\r\n";
-          HAL_UART_Transmit(&huart3, (uint8_t*)msg_nok, strlen(msg_nok), HAL_MAX_DELAY);
-      }
-  }
+  const char msg_note[] = "[STM32] You should see VERSION and RXSTATUS immediately!\r\n";
+  HAL_UART_Transmit(&huart3, (uint8_t*)msg_note, strlen(msg_note), HAL_MAX_DELAY);
+  const char msg_note2[] = "[STM32] For position data: connect antenna + sky view\r\n";
+  HAL_UART_Transmit(&huart3, (uint8_t*)msg_note2, strlen(msg_note2), HAL_MAX_DELAY);
   
   oem_rx_head = 0;
   
   // ============================================================
-  // Step 8: Wait 3 seconds for TIMEA periodic data
+  // Step 9: Wait 3 seconds to collect initial responses
   // ============================================================
-  const char msg_wait[] = "[STM32] Waiting 3 sec for TIMEA logs...\r\n";
+  const char msg_wait[] = "[STM32] Waiting 3 sec for log confirmations...\r\n";
   HAL_UART_Transmit(&huart3, (uint8_t*)msg_wait, strlen(msg_wait), HAL_MAX_DELAY);
   
   HAL_Delay(3000);
   
   if (oem_rx_head > 0) {
       char resp[80];
-      snprintf(resp, sizeof(resp), "[STM32] *** SUCCESS! Got %d bytes of data! ***\r\n", oem_rx_head);
+      snprintf(resp, sizeof(resp), "[STM32] Got %d bytes of responses\r\n", oem_rx_head);
       HAL_UART_Transmit(&huart3, (uint8_t*)resp, strlen(resp), HAL_MAX_DELAY);
-      
-      const char msg_hex[] = "[STM32] First 100 bytes in hex:\r\n";
-      HAL_UART_Transmit(&huart3, (uint8_t*)msg_hex, strlen(msg_hex), HAL_MAX_DELAY);
-      
-      for (int i = 0; i < oem_rx_head && i < 100; i++) {
-          char hex[4];
-          snprintf(hex, sizeof(hex), "%02X ", oem_rx_buffer[i]);
-          HAL_UART_Transmit(&huart3, (uint8_t*)hex, strlen(hex), HAL_MAX_DELAY);
-          if ((i + 1) % 16 == 0) {
-              HAL_UART_Transmit(&huart3, (uint8_t*)"\r\n", 2, HAL_MAX_DELAY);
-          }
-      }
-      HAL_UART_Transmit(&huart3, (uint8_t*)"\r\n\r\n", 3, HAL_MAX_DELAY);
-  } else {
-      const char msg_fail[] = "[STM32] ERROR: No TIMEA data received!\r\n\r\n";
-      HAL_UART_Transmit(&huart3, (uint8_t*)msg_fail, strlen(msg_fail), HAL_MAX_DELAY);
   }
   
   oem_rx_head = 0;
   
   const char msg5[] = "=========================================\r\n";
   HAL_UART_Transmit(&huart3, (uint8_t*)msg5, strlen(msg5), HAL_MAX_DELAY);
-  const char msg6[] = "Now streaming ALL OEM719 data...\r\n\r\n";
+  const char msg6[] = "OEM719 LIVE DATA STREAM (with message parsing)\r\n";
   HAL_UART_Transmit(&huart3, (uint8_t*)msg6, strlen(msg6), HAL_MAX_DELAY);
+  const char msg7[] = "Messages will be displayed with timestamps\r\n";
+  HAL_UART_Transmit(&huart3, (uint8_t*)msg7, strlen(msg7), HAL_MAX_DELAY);
+  const char msg8[] = "=========================================\r\n\r\n";
+  HAL_UART_Transmit(&huart3, (uint8_t*)msg8, strlen(msg8), HAL_MAX_DELAY);
   
   // Start tail at current head to skip already-processed data
   uint16_t start_head = oem_rx_head;
@@ -591,50 +721,70 @@ int main(void)
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   uint16_t oem_rx_tail = start_head;  // Start after already-shown data
-  uint32_t last_forward_tick = HAL_GetTick();
-  uint32_t last_debug_tick = HAL_GetTick();
-  uint16_t last_rx_head = start_head;
+  uint32_t last_stats_tick = HAL_GetTick();
+  uint32_t msg_count = 0;
+  uint32_t byte_count = 0;
+  
+  // Line parsing state
+  uint8_t line_buffer[256];
+  uint16_t line_pos = 0;
+  bool in_message = false;
   
   while (1)
   {
     SPILoop_HandleRequests();
     
-    // Debug: Show data rate every 5 seconds
-    uint32_t now = HAL_GetTick();
-    if ((now - last_debug_tick) >= 5000) {
-        last_debug_tick = now;
+    // Parse and display OEM719 messages line-by-line with formatting
+    while (oem_rx_head != oem_rx_tail) {
+        uint8_t byte = oem_rx_buffer[oem_rx_tail];
+        oem_rx_tail = (oem_rx_tail + 1) % OEM_RX_BUF_SIZE;
+        byte_count++;
         
-        uint16_t bytes_since_start = oem_rx_head - start_head;
-        uint16_t bytes_this_period = oem_rx_head - last_rx_head;
+        // Detect start of message
+        if (byte == '#' || byte == '<' || byte == '[') {
+            if (line_pos > 0) {
+                // Flush previous line
+                HAL_UART_Transmit(&huart3, line_buffer, line_pos, 100);
+                HAL_UART_Transmit(&huart3, (uint8_t*)"\r\n", 2, 100);
+                line_pos = 0;
+            }
+            in_message = true;
+            msg_count++;
+            
+            // Add timestamp prefix for new messages
+            uint32_t now = HAL_GetTick();
+            char prefix[32];
+            int n = snprintf(prefix, sizeof(prefix), "[%lu.%03lu] ", 
+                           (unsigned long)(now/1000), (unsigned long)(now%1000));
+            HAL_UART_Transmit(&huart3, (uint8_t*)prefix, (uint16_t)n, 100);
+        }
         
-        char dbg[100];
-        snprintf(dbg, sizeof(dbg), "[DEBUG] Total: %d bytes | Last 5s: %d bytes\r\n", 
-                 bytes_since_start, bytes_this_period);
-        HAL_UART_Transmit(&huart3, (uint8_t*)dbg, strlen(dbg), HAL_MAX_DELAY);
+        // Buffer the byte
+        if (line_pos < sizeof(line_buffer) - 1) {
+            line_buffer[line_pos++] = byte;
+        }
         
-        last_rx_head = oem_rx_head;
+        // Detect end of line
+        if (byte == '\n') {
+            // Flush complete line
+            HAL_UART_Transmit(&huart3, line_buffer, line_pos, 100);
+            line_pos = 0;
+            in_message = false;
+        }
     }
     
-    // Forward OEM719 data to PC via USART3 in real-time
-    if (oem_rx_head != oem_rx_tail) {
-        // Calculate how many bytes are available
-        uint16_t bytes_avail;
-        if (oem_rx_head >= oem_rx_tail) {
-            bytes_avail = oem_rx_head - oem_rx_tail;
-        } else {
-            bytes_avail = OEM_RX_BUF_SIZE - oem_rx_tail;
-        }
+    // Periodic statistics every 10 seconds
+    uint32_t now = HAL_GetTick();
+    if ((now - last_stats_tick) >= 10000) {
+        last_stats_tick = now;
         
-        if (bytes_avail > 0) {
-            // Forward data to PC immediately
-            HAL_StatusTypeDef status = HAL_UART_Transmit(&huart3, 
-                                                         &oem_rx_buffer[oem_rx_tail], 
-                                                         bytes_avail, 
-                                                         100);
-            if (status == HAL_OK) {
-                oem_rx_tail = (oem_rx_tail + bytes_avail) % OEM_RX_BUF_SIZE;
-            }
-        }
+        char stats[150];
+        int n = snprintf(stats, sizeof(stats), 
+                        "\r\n[STATS] Messages: %lu | Bytes: %lu | UART Errors: %lu | Uptime: %lu.%03lus\r\n\r\n",
+                        (unsigned long)msg_count, (unsigned long)byte_count, 
+                        (unsigned long)oem_uart_error_count,
+                        (unsigned long)(now/1000), (unsigned long)(now%1000));
+        HAL_UART_Transmit(&huart3, (uint8_t*)stats, (uint16_t)n, HAL_MAX_DELAY);
     }
     
     /* USER CODE END WHILE */
@@ -1053,41 +1203,6 @@ static void MX_USART6_UART_Init(void)
 }
 
 /**
-  * @brief USB_OTG_FS Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_USB_OTG_FS_PCD_Init(void)
-{
-
-  /* USER CODE BEGIN USB_OTG_FS_Init 0 */
-
-  /* USER CODE END USB_OTG_FS_Init 0 */
-
-  /* USER CODE BEGIN USB_OTG_FS_Init 1 */
-
-  /* USER CODE END USB_OTG_FS_Init 1 */
-  hpcd_USB_OTG_FS.Instance = USB_OTG_FS;
-  hpcd_USB_OTG_FS.Init.dev_endpoints = 6;
-  hpcd_USB_OTG_FS.Init.speed = PCD_SPEED_FULL;
-  hpcd_USB_OTG_FS.Init.dma_enable = DISABLE;
-  hpcd_USB_OTG_FS.Init.phy_itface = PCD_PHY_EMBEDDED;
-  hpcd_USB_OTG_FS.Init.Sof_enable = ENABLE;
-  hpcd_USB_OTG_FS.Init.low_power_enable = DISABLE;
-  hpcd_USB_OTG_FS.Init.lpm_enable = DISABLE;
-  hpcd_USB_OTG_FS.Init.vbus_sensing_enable = ENABLE;
-  hpcd_USB_OTG_FS.Init.use_dedicated_ep1 = DISABLE;
-  if (HAL_PCD_Init(&hpcd_USB_OTG_FS) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN USB_OTG_FS_Init 2 */
-
-  /* USER CODE END USB_OTG_FS_Init 2 */
-
-}
-
-/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -1140,6 +1255,20 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(USB_OverCurrent_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : USB_SOF_Pin USB_ID_Pin USB_DM_Pin USB_DP_Pin */
+  GPIO_InitStruct.Pin = USB_SOF_Pin|USB_ID_Pin|USB_DM_Pin|USB_DP_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  GPIO_InitStruct.Alternate = GPIO_AF10_OTG_FS;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : USB_VBUS_Pin */
+  GPIO_InitStruct.Pin = USB_VBUS_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(USB_VBUS_GPIO_Port, &GPIO_InitStruct);
 
   /* EXTI interrupt init*/
   HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
